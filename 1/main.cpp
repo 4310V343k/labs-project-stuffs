@@ -7,13 +7,13 @@
 //
 //  Для метода простой итерации:
 //    e^x = x^{-1/2}  =>  e^{-x} = x^{1/2}  =>  x = e^{-2x}
-//    phi(x) = e^{-2x},  |g'(x)| = |-2e^{-2x}| < 1 => сходится к корню
+//    phi(x) = e^{-2x},  |phi'(x)| = |-2e^{-2x}| < 1 => сходится к корню
 
 double f(double x) {
     return std::exp(x) - 1.0 / std::sqrt(x);
 }
 
-// Итерационная функция phi(x) = e^{-2x}
+// phi(x) = e^{-2x}
 double phi(double x) {
     return std::exp(-2.0 * x);
 }
@@ -30,10 +30,10 @@ double bisection(double a, double b, double eps, int& iters) {
 
         // Если знак функции меняется слева от центра
         if (f(a) * f(с) < 0)
-            // Сдвигаем правую границу
+            // Сдвигаем правую границу влево
             b = с;
         else
-            // Сдвигаем левую границу
+            // Сдвигаем левую границу вправо
             a = с;
     }
     return (a + b) / 2.0;
@@ -47,19 +47,25 @@ double simpleIteration(double x0, double eps, int& iters) {
     double x = x0;
     while (true) {
         ++iters;
+        // Вычисляем следующее приближение
         double xNext = phi(x);
         if (std::abs(xNext - x) < eps) {
             return xNext;
         }
         x = xNext;
+
+        if (iters > 10000) {  // Защита от бесконечного цикла
+            std::cerr << "Метод простой итерации не сошелся за 10000 итераций.\n";
+            return x;
+        }
     }
 }
 
 int main() {
     const double A = 0.3;
     const double B = 0.8;
-    const double EPS1 = 1e-2;   // первая точность
-    const double EPS2 = 1e-4;   // вторая точность
+    const double EPS1 = 1e-2;  // первая точность
+    const double EPS2 = 1e-4;  // вторая точность
 
     std::cout << std::fixed << std::setprecision(8);
 
@@ -69,7 +75,7 @@ int main() {
     std::cout << "=== Метод бисекции (eps = 1e-2) ===\n";
     std::cout << "Корень:          x = " << rootBisect1 << "\n";
     std::cout << "              f(x) = " << f(rootBisect1) << "\n";
-    std::cout << "Число итераций:  " << iterBisect1 << "\n\n";
+    std::cout << "Число итераций:  "     << iterBisect1 << "\n\n";
 
     // 2. Метод простой итерации, eps = 1e-2
     double x0_iter = (A + B) / 2.0;
@@ -78,7 +84,7 @@ int main() {
     std::cout << "=== Метод простой итерации (eps = 1e-2), x0 = " << x0_iter << " ===\n";
     std::cout << "Корень:          x = " << rootSimple1 << "\n";
     std::cout << "              f(x) = " << f(rootSimple1) << "\n";
-    std::cout << "Число итераций:  " << iterSimple1 << "\n\n";
+    std::cout << "Число итераций:  "     << iterSimple1 << "\n\n";
 
     // 3. Уточнение методом простой итерации, eps = 1e-4
     std::cout << "=== Уточнение методом простой итерации (eps = 1e-4) ===\n";
@@ -88,16 +94,18 @@ int main() {
     double rootSimple2 = simpleIteration(rootBisect1, EPS2, iterSimple2);
     std::cout << "Корень:          x = " << rootSimple2 << "\n";
     std::cout << "              f(x) = " << f(rootSimple2) << "\n";
-    std::cout << "Число итераций:  " << iterSimple2 << "\n\n";
+    std::cout << "Число итераций:  "     << iterSimple2 << "\n\n";
 
     // 4. Сравнение
     std::cout << "=== Сравнение методов ===\n";
     std::cout << std::left
-              << std::setw(45) << "Метод"
-              << std::setw(18) << "Корень"
-              << std::setw(20) << "Итерации"
+              << std::setw(44) << "Метод"
+              << std::setw(22) << "Корень"
+              << std::setw(18) << "Итерации"
               << "Точность\n";
+
     std::cout << std::string(80, '-') << "\n";
+
     std::cout << std::setw(47) << "Бисекция"
               << std::setw(16) << rootBisect1
               << std::setw(10) << iterBisect1
