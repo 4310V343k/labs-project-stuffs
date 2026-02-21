@@ -96,7 +96,9 @@ struct AppState {
 // -----------------------------------------------------------------------
 // Выполнение операции
 // -----------------------------------------------------------------------
-
+// Выполняется в отдельном треде
+// Копирует все данные, затем проверяет входные данные,
+// парсит числа, выполняет операцию и обновляет результат
 static void do_execute(AppState &st) {
 
     // Копируем все изменяемые снаружи данные, нужные для выполнения, в тред
@@ -402,6 +404,7 @@ static size_t count_digits(const std::string &s) {
     return cnt;
 }
 
+// цветные кнопочки
 static ButtonOption SmallAnimatedButtonOption(Color color) {
   ButtonOption option;
   option.transform = [](const EntryState& s) {
@@ -416,6 +419,7 @@ static ButtonOption SmallAnimatedButtonOption(Color color) {
   return option;
 }
 
+// Создаёт все компоненты интерфейса, обработчики
 static void run_ui() {
     AppState st;
     auto screen = ScreenInteractive::Fullscreen();
@@ -432,29 +436,29 @@ static void run_ui() {
     auto input_out = Input(&st.file_out, "result.txt", single_line);
     auto input_exp = Input(&st.exp_input, "1-3", single_line);
 
-    // Просмотр результата (многострочный, только для чтения)
-    InputOption result_opt;
-    result_opt.multiline = true;
-    result_opt.password  = false;
-    std::string result_display_text;
-    auto result_input = Input(&result_display_text, "", result_opt);
-    auto result_readonly = CatchEvent(result_input, [](Event e) {
+    // Просмотр результата
+    auto readonly_input = CatchEvent([](Event e) {
         if (e.is_character() || e == Event::Backspace || e == Event::Delete || e == Event::Return)
             return true; // блокируем редактирование
         return false;
     });
-    auto result_view = Renderer(result_readonly, [&st, &result_readonly] {
+    std::string result_display_text;
+    InputOption result_input_opt;
+    result_input_opt.transform = [&st](InputState state) {
+        state.element |= color(Color::White) | vscroll_indicator | hscroll_indicator | frame;
+
         bool empty_result = false;
         {
             std::lock_guard<std::mutex> lock(st.mtx);
             empty_result = st.result_text.empty();
         }
-        Element body = result_readonly->Render() | vscroll_indicator | hscroll_indicator | frame;
-        if (empty_result) {
-            body = body | color(Color::GrayDark) | dim;
+        if (state.is_placeholder || empty_result) {
+            state.element |= color(Color::GrayDark) | dim;
         }
-        return body;
-    });
+
+        return state.element;
+    };
+    auto result_input = Input(&result_display_text, "") | readonly_input;
 
     // Отмечаем результат устаревшим при любом вводе символа
     auto mark_stale = [&st](std::optional<std::reference_wrapper<bool>> cache_value = std::nullopt) {
@@ -629,17 +633,15 @@ static void run_ui() {
         dropdown,
         Container::Horizontal({target_radio, input_exp_tracked}),
         Container::Horizontal({btn_execute, btn_quit}),
-    });
-
-    auto root = Container::Vertical({
-        all,
-        result_view,
+        result_input,
     });
 
     // Основной рендерер
-    auto renderer = Renderer(root, [&]() -> Element {
+    // Работает почти как реакт - все интерактивные элементы встраиваются в страницу
+    // При изменении любого элемента, который влияет на отображение (all), автоматически рендер
+    auto renderer = Renderer(all, [&]() -> Element {
 
-        // Снимок состояния для рендера
+        // Снимок состояния для текущего рендера
         std::string status_msg;
         bool        result_stale = false;
         bool        is_working   = false;
@@ -682,22 +684,24 @@ static void run_ui() {
         // Отслеживаем изменения для пометки устаревания
         if (selected_op_local != prev_selected_op) {
             prev_selected_op = selected_op_local;
+            result_stale     = true;
             std::lock_guard<std::mutex> lock(st.mtx);
             st.result_stale  = true;
-            result_stale    = true;
         }
         if (target_ab_local != prev_target_ab) {
             prev_target_ab  = target_ab_local;
+            result_stale    = true;
             std::lock_guard<std::mutex> lock(st.mtx);
             st.result_stale = true;
-            result_stale    = true;
         }
 
         // Индикатор актуальности результата / работы
         Element stale_indicator;
         if (is_working) {
-            stale_indicator = hbox({text(" * Выполняется "), spinner(6, static_cast<size_t>(spinner_idx))})
-                              | color(Color::White) | bold;
+            stale_indicator = hbox({
+                text(" * Выполняется "),
+                spinner(5, static_cast<size_t>(spinner_idx))
+            }) | color(Color::White) | bold;
         } else if (result_stale) {
             stale_indicator = text(" ! Результат устарел") | color(Color::Yellow);
         } else if (!result_text.empty()) {
@@ -789,12 +793,13 @@ static void run_ui() {
             stale_indicator,
         }) | notflex;
 
+        // Результат
         auto result_box = window(
             text(" Результат (" + std::to_string(digits_res) + " цифр) "),
-            result_view->Render() | flex
+            result_input->Render() | flex
         ) | size(HEIGHT, LESS_THAN, 14) | flex;
 
-        // Блок исключения девяток
+        // Блок исключения девяток (добавляется в отображение только при сложении)
         Element con_block = text("");
         if (show_con) {
             auto mk_row = [](const std::string &lbl, int val) {
@@ -803,18 +808,20 @@ static void run_ui() {
                     text(std::to_string(val)) | bold,
                 });
             };
-            // Формируем строку проверки без спецсимволов
+            // Формируем строку проверки
+            Color ck_color;
             std::string check_lbl;
             if (con_ok) {
+                ck_color = Color::Green;
                 check_lbl = " -> " + std::to_string(con_ra) + " + "
                           + std::to_string(con_rb) + " = "
                           + std::to_string(con_rs) + " (mod 9)  OK";
             } else {
+                ck_color = Color::Red;
                 check_lbl = " -> ОШИБКА: " + std::to_string(con_ra) + " + "
                           + std::to_string(con_rb) + " != "
                           + std::to_string(con_rs) + " (mod 9)  FAIL";
             }
-            Color ck_color = con_ok ? Color::Green : Color::Red;
 
             con_block = window(text(" Проверка (исключение девяток) "),
                 vbox({
