@@ -7,6 +7,7 @@
 #include <ftxui/dom/elements.hpp>
 
 #include <chrono>
+#include <format>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -15,7 +16,19 @@ using namespace ftxui;
 namespace hrc = std::chrono;
 
 // -----------------------------------------------------------------------
-// Вспомогательные функции для измерения времени
+// Содержимое файла
+// 1. Вспомогательные функции для отображения и форматирования
+// 2. Состояние приложения
+// 3. Функция do_execute, которая запускается в отдельном потоке,
+//   выполняет выбранную операцию и обновляет состояние
+// 4. Функция run_ui, которая запускает интерфейс и обрабатывает взаимодействия
+// 5. main, который запускает UI
+// -----------------------------------------------------------------------
+
+
+
+// -----------------------------------------------------------------------
+// Вспомогательные функции для измерения и отображения времени
 // -----------------------------------------------------------------------
 
 using Clock     = hrc::high_resolution_clock;
@@ -26,15 +39,14 @@ static double ms_between(TimePoint a, TimePoint b) {
 }
 
 static std::string fmt_ms(double ms) {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.3f мс", ms);
-    return buf;
+    return std::format("{:.3f} мс", ms);
 }
 
 // -----------------------------------------------------------------------
 // Состояние приложения
 // -----------------------------------------------------------------------
 
+// Доступ к состоянию только через мьютекс для упрощения синхронизации между потоками
 struct AppState {
     // Редактируемые числа
     std::string input_a        = "";
@@ -71,21 +83,275 @@ struct AppState {
     double t_op      = -1.0;
     double t_to_dec  = -1.0;
 
-    // Кэш отпарсенных чисел (только цифры, без пробелов и переносов)
-    std::string cached_sa     = "";
-    std::string cached_sb     = "";
+    // Кэш спаршенных чисел
     BigNum      cached_bn_a;
     BigNum      cached_bn_b;
     bool        cache_a_valid = false;
     bool        cache_b_valid = false;
 
-    // Блокировка для фоновой работы
+    // Блокировка для рабочего треда
     std::mutex mtx;
 };
 
 // -----------------------------------------------------------------------
-// Названия операций
+// Выполнение операции
 // -----------------------------------------------------------------------
+
+static void do_execute(AppState &st) {
+
+    // Копируем все изменяемые снаружи данные, нужные для выполнения, в тред
+    std::string input_a;
+    std::string input_b;
+    std::string exp_input;
+    int         selected_op = 0;
+    int         target_ab   = 0;
+    std::string file_out_path;
+    bool        cache_a_valid;
+    bool        cache_b_valid;
+    {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        input_a       = st.input_a;
+        input_b       = st.input_b;
+        exp_input     = st.exp_input;
+        selected_op   = st.selected_op;
+        target_ab     = st.target_ab;
+        file_out_path = st.file_out;
+        cache_a_valid = st.cache_a_valid;
+        cache_b_valid = st.cache_b_valid;
+        st.show_con   = false;
+        // Сбрасываем тайминги, новые будут установлены по мере выполнения
+        st.t_parse_a = st.t_parse_b = st.t_op = st.t_to_dec = -1.0;
+    }
+
+    // Убирает все лишние символы из строки, оставляя только десятичные цифры
+    auto digits_only = [](const std::string &s) -> std::string {
+        std::string r;
+        r.reserve(s.size());
+        for (char c : s)
+            if (c >= '0' && c <= '9') r += c;
+        return r;
+    };
+
+    std::string sa = digits_only(input_a);
+    std::string sb = digits_only(input_b);
+
+    bool should_check_a_valid = true;
+    bool should_check_b_valid = true;
+    // Для операций, где нужно выбрать число, к которому применяется операция
+    // (степень и простота), можно проверять только выбранное число
+    if (selected_op == 3 || selected_op == 4) {
+        should_check_a_valid = (target_ab == 0);
+        should_check_b_valid = (target_ab == 1);
+    }
+
+    // Валидация входных чисел
+    if (should_check_a_valid && sa.empty()) {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        st.status_msg   = "Ошибка: число A пустое";
+        st.is_working   = false;
+        return;
+    }
+    if (should_check_b_valid && sb.empty()) {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        st.status_msg   = "Ошибка: число B пустое";
+        st.is_working   = false;
+        return;
+    }
+    if (should_check_a_valid && !bignum_is_valid_decimal(sa)) {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        st.status_msg   = "Ошибка: число A содержит недопустимые символы или ведущие нули";
+        st.is_working   = false;
+        return;
+    }
+    if (should_check_b_valid && !bignum_is_valid_decimal(sb)) {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        st.status_msg   = "Ошибка: число B содержит недопустимые символы или ведущие нули";
+        st.is_working   = false;
+        return;
+    }
+
+    // Проверка введённой степени
+    int exp_val = 0;
+    if (selected_op == 3) {
+        try { exp_val = std::stoi(exp_input); } catch (...) { exp_val = 0; }
+        if (exp_val < 1 || exp_val > 3) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.status_msg   = "Ошибка: степень должна быть от 1 до 3";
+            st.is_working   = false;
+            return;
+        }
+    }
+
+    // Парсинг больших чисел
+    BigNum bn_a, bn_b;
+    if (!sa.empty()) {
+        if (cache_a_valid) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            bn_a = st.cached_bn_a;
+            st.t_parse_a = -2.0; // кэшировано
+        } else {
+            auto t0 = Clock::now();
+            bn_a = bignum_from_decimal(sa);
+            auto t1 = Clock::now();
+            {
+                std::lock_guard<std::mutex> lock(st.mtx);
+                st.t_parse_a     = ms_between(t0, t1);
+                st.cached_bn_a   = bn_a;
+                st.cache_a_valid = true;
+            }
+        }
+    }
+
+    if (!sb.empty()) {
+        if (cache_b_valid) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            bn_b = st.cached_bn_b;
+            st.t_parse_b = -2.0; // кэшировано
+        } else {
+            auto t0 = Clock::now();
+            bn_b = bignum_from_decimal(sb);
+            auto t1 = Clock::now();
+            {
+                std::lock_guard<std::mutex> lock(st.mtx);
+                st.t_parse_b     = ms_between(t0, t1);
+                st.cached_bn_b   = bn_b;
+                st.cache_b_valid = true;
+            }
+        }
+    }
+
+    // Локальные переменные для результатов
+    // тайминги
+    double      local_t_op     = -1.0;
+    double      local_t_to_dec = -1.0;
+    // проверка сложения (исключение девяток)
+    bool        local_show_con = false;
+    int         local_con_ra = 0, local_con_rb = 0, local_con_rs = 0;
+    bool        local_con_ok   = false;
+    std::string op_result_text;
+
+    try {
+        auto op_start = Clock::now();
+
+        // Некоторые операции завершаются идентично
+        auto finish_bignum = [&](BigNum bn) {
+            local_t_op = ms_between(op_start, Clock::now());
+            {
+                std::lock_guard<std::mutex> lock(st.mtx);
+                st.t_op = local_t_op;
+            }
+            auto t0        = Clock::now();
+            op_result_text = bignum_to_decimal(bn);
+            auto t1        = Clock::now();
+            local_t_to_dec = ms_between(t0, t1);
+        };
+
+        switch (selected_op) {
+            case 0: { // Сложение
+                BigNum sum  = bignum_add(bn_a, bn_b);
+
+                local_con_ra   = bignum_digit_root(bn_a);
+                local_con_rb   = bignum_digit_root(bn_b);
+                local_con_rs   = bignum_digit_root(sum);
+                local_con_ok   = (local_con_ra + local_con_rb) % 9 == local_con_rs % 9;
+                local_show_con = true;
+
+                finish_bignum(sum);
+                break;
+            }
+            case 1: { // Умножение
+                finish_bignum(bignum_mul(bn_a, bn_b));
+                break;
+            }
+            case 2: { // Деление с остатком
+                if (bignum_is_zero(bn_b)) {
+                    std::lock_guard<std::mutex> lock(st.mtx);
+                    st.status_msg = "Ошибка: деление на ноль";
+                    st.is_working = false;
+                    return;
+                }
+                auto [q, r] = bignum_divmod(bn_a, bn_b);
+                local_t_op   = ms_between(op_start, Clock::now());
+                {
+                    std::lock_guard<std::mutex> lock(st.mtx);
+                    st.t_op = local_t_op;
+                }
+
+                auto t0 = Clock::now();
+                std::string qs     = bignum_to_decimal(q);
+                std::string rs_str = bignum_to_decimal(r);
+                auto t1 = Clock::now();
+                local_t_to_dec = ms_between(t0, t1);
+
+                op_result_text = "Частное:\n" + qs + "\n\nОстаток:\n" + rs_str;
+                break;
+            }
+            case 3: { // Степень
+                BigNum &base_bn = (target_ab == 0) ? bn_a : bn_b;
+                finish_bignum(bignum_pow(base_bn, exp_val));
+                break;
+            }
+            case 4: { // Простота
+                BigNum &target = (target_ab == 0) ? bn_a : bn_b;
+                auto t0    = Clock::now();
+                bool prime = bignum_is_prime(target);
+                local_t_op = ms_between(t0, Clock::now());
+
+                op_result_text = prime
+                    ? "Число является простым"
+                    : "Число является составным (не простым)";
+                break;
+            }
+            case 5: { // Сравнение
+                int cmp    = bignum_cmp(bn_a, bn_b);
+                local_t_op = ms_between(op_start, Clock::now());
+
+
+                if      (cmp < 0) op_result_text = "A < B";
+                else if (cmp > 0) op_result_text = "A > B";
+                else              op_result_text = "A = B";
+                break;
+            }
+        }
+    } catch (const std::exception &ex) {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        st.status_msg = std::string("Ошибка: ") + ex.what();
+        st.is_working = false;
+        return;
+    }
+
+    std::string save_error;
+    try {
+        std::ofstream ofs(file_out_path);
+        if (!ofs) throw std::runtime_error("Не удалось открыть файл для записи: " + file_out_path);
+        ofs << op_result_text;
+        if (!ofs) throw std::runtime_error("Ошибка записи в файл: " + file_out_path);
+    } catch (const std::exception &ex) {
+        save_error = std::string("Ошибка записи результата: ") + ex.what();
+    }
+
+    // Запись состояния
+    {
+        std::lock_guard<std::mutex> lock(st.mtx);
+        st.result_text  = op_result_text;
+        st.t_op         = local_t_op;
+        st.t_to_dec     = local_t_to_dec;
+        st.show_con     = local_show_con;
+        st.con_ra       = local_con_ra;
+        st.con_rb       = local_con_rb;
+        st.con_rs       = local_con_rs;
+        st.con_ok       = local_con_ok;
+        st.result_stale = false;
+        st.status_msg   = save_error.empty() ? "Готово" : save_error;
+        st.is_working   = false;
+    }
+}
+
+// -----------------------------------------------------------------------
+// Графический интерфейс
+// -----------------------------------------------------------------------
+
+// Некоторые вспомогательные функции
 
 static const std::vector<std::string> OP_NAMES = {
     "Сложение",
@@ -136,14 +402,6 @@ static size_t count_digits(const std::string &s) {
     return cnt;
 }
 
-// Сохранить строку в файл
-static void save_to_file(const std::string &path, const std::string &data) {
-    std::ofstream ofs(path);
-    if (!ofs) throw std::runtime_error("Не удалось открыть файл для записи: " + path);
-    ofs << data;
-    if (!ofs) throw std::runtime_error("Ошибка записи в файл: " + path);
-}
-
 static ButtonOption SmallAnimatedButtonOption(Color color) {
   ButtonOption option;
   option.transform = [](const EntryState& s) {
@@ -157,297 +415,6 @@ static ButtonOption SmallAnimatedButtonOption(Color color) {
   option.animated_colors.background.Set(Color::Interpolate(0.85F, color, Color::Black), Color::Interpolate(0.10F, color, Color::Black));
   return option;
 }
-
-// -----------------------------------------------------------------------
-// Выполнение операции
-// -----------------------------------------------------------------------
-
-static void do_execute(AppState &st, ScreenInteractive &screen) {
-    (void)screen;
-
-    // Берём снимок входных значений под мьютексом
-    std::string input_a;
-    std::string input_b;
-    std::string exp_input;
-    int         selected_op = 0;
-    int         target_ab   = 0;
-    std::string file_out_path;
-    {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        input_a       = st.input_a;
-        input_b       = st.input_b;
-        exp_input     = st.exp_input;
-        selected_op   = st.selected_op;
-        target_ab     = st.target_ab;
-        file_out_path = st.file_out;
-        st.show_con   = false;
-        st.t_parse_a = st.t_parse_b = st.t_op = st.t_to_dec = -1.0;
-    }
-
-    auto digits_only = [](const std::string &s) -> std::string {
-        std::string r;
-        r.reserve(s.size());
-        for (char c : s)
-            if (c >= '0' && c <= '9') r += c;
-        return r;
-    };
-
-    std::string sa = digits_only(input_a);
-    std::string sb = digits_only(input_b);
-
-    auto write_result = [&](const std::string &text) -> std::string {
-        try {
-            save_to_file(file_out_path, text);
-            return "";
-        } catch (const std::exception &ex) {
-            return std::string("Ошибка записи результата: ") + ex.what();
-        }
-    };
-    bool check_a_valid = true;
-    bool check_b_valid = true;
-    if (selected_op == 3 || selected_op == 4) {
-        check_a_valid = (target_ab == 0);
-        check_b_valid = (target_ab == 1);
-    }
-
-    // Валидация входов
-    if (check_a_valid && sa.empty()) {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        st.status_msg   = "Ошибка: число A пустое";
-        st.is_working   = false;
-        return;
-    }
-    if (check_b_valid && sb.empty()) {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        st.status_msg   = "Ошибка: число B пустое";
-        st.is_working   = false;
-        return;
-    }
-    if (check_a_valid && !bignum_is_valid_decimal(sa)) {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        st.status_msg   = "Ошибка: число A содержит недопустимые символы или ведущие нули";
-        st.is_working   = false;
-        return;
-    }
-    if (check_b_valid && !bignum_is_valid_decimal(sb)) {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        st.status_msg   = "Ошибка: число B содержит недопустимые символы или ведущие нули";
-        st.is_working   = false;
-        return;
-    }
-
-    int exp_val = 0;
-    if (selected_op == 3) {
-        try { exp_val = std::stoi(exp_input); } catch (...) { exp_val = 0; }
-        if (exp_val < 1 || exp_val > 3) {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            st.status_msg   = "Ошибка: степень должна быть от 1 до 3";
-            st.is_working   = false;
-            return;
-        }
-    }
-
-    // Парсинг с учётом кэша под мьютексом
-    BigNum bn_a, bn_b;
-    if (!sa.empty()) {
-        bool cache_hit = false;
-        {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            if (st.cache_a_valid && st.cached_sa == sa) {
-                bn_a         = st.cached_bn_a;
-                st.t_parse_a = -2.0;
-                cache_hit    = true;
-            }
-        }
-        if (!cache_hit) {
-            auto t0 = Clock::now();
-            bn_a = bignum_from_decimal(sa);
-            auto t1 = Clock::now();
-            {
-                std::lock_guard<std::mutex> lock(st.mtx);
-                st.t_parse_a     = ms_between(t0, t1);
-                st.cached_sa     = sa;
-                st.cached_bn_a   = bn_a;
-                st.cache_a_valid = true;
-            }
-        }
-    }
-
-    if (!sb.empty()) {
-        bool cache_hit = false;
-        {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            if (st.cache_b_valid && st.cached_sb == sb) {
-                bn_b         = st.cached_bn_b;
-                st.t_parse_b = -2.0;
-                cache_hit    = true;
-            }
-        }
-        if (!cache_hit) {
-            auto t0 = Clock::now();
-            bn_b = bignum_from_decimal(sb);
-            auto t1 = Clock::now();
-            {
-                std::lock_guard<std::mutex> lock(st.mtx);
-                st.t_parse_b     = ms_between(t0, t1);
-                st.cached_sb     = sb;
-                st.cached_bn_b   = bn_b;
-                st.cache_b_valid = true;
-            }
-        }
-    }
-
-    BigNum result_bn;
-    bool   result_is_bignum = true;
-    std::string result_direct;
-    std::string final_result_text;
-    std::string save_error;
-
-    try {
-        auto op_start = Clock::now();
-
-        switch (selected_op) {
-            case 0: { // Сложение
-                result_bn = bignum_add(bn_a, bn_b);
-                auto op_end = Clock::now();
-                int ra = bignum_digit_root(bn_a);
-                int rb = bignum_digit_root(bn_b);
-                int rs = bignum_digit_root(result_bn);
-                bool ok = bignum_verify_add(bn_a, bn_b, result_bn);
-
-                auto t0 = Clock::now();
-                std::string res_dec = bignum_to_decimal(result_bn);
-                auto t1 = Clock::now();
-
-                std::string combined = res_dec + "\n\nПроверка (исключение девяток): "
-                      + std::to_string(ra) + " + "
-                      + std::to_string(rb) + " = "
-                      + std::to_string(rs) + (ok ? "  OK" : "  FAIL");
-
-                {
-                    std::lock_guard<std::mutex> lock(st.mtx);
-                    st.t_op     = ms_between(op_start, op_end);
-                    st.t_to_dec = ms_between(t0, t1);
-                    st.con_ra   = ra;
-                    st.con_rb   = rb;
-                    st.con_rs   = rs;
-                    st.con_ok   = ok;
-                    st.show_con = true;
-                }
-
-                result_is_bignum = false;
-                result_direct    = combined;
-                break;
-            }
-            case 1: { // Умножение
-                result_bn = bignum_mul(bn_a, bn_b);
-                auto op_end = Clock::now();
-                std::lock_guard<std::mutex> lock(st.mtx);
-                st.t_op = ms_between(op_start, op_end);
-                break;
-            }
-            case 2: { // Деление с остатком
-                if (bignum_is_zero(bn_b)) {
-                    std::lock_guard<std::mutex> lock(st.mtx);
-                    st.status_msg = "Ошибка: деление на ноль";
-                    st.is_working = false;
-                    return;
-                }
-                auto [q, r] = bignum_divmod(bn_a, bn_b);
-                auto op_end = Clock::now();
-                auto t0 = Clock::now();
-                std::string qs = bignum_to_decimal(q);
-                std::string rs_str = bignum_to_decimal(r);
-                auto t1 = Clock::now();
-                {
-                    std::lock_guard<std::mutex> lock(st.mtx);
-                    st.t_op     = ms_between(op_start, op_end);
-                    st.t_to_dec = ms_between(t0, t1);
-                }
-                result_is_bignum = false;
-                result_direct = "Частное:\n" + qs + "\n\nОстаток:\n" + rs_str;
-                break;
-            }
-            case 3: { // Степень
-                BigNum &base_bn = (target_ab == 0) ? bn_a : bn_b;
-                result_bn = bignum_pow(base_bn, exp_val);
-                auto op_end = Clock::now();
-                std::lock_guard<std::mutex> lock(st.mtx);
-                st.t_op = ms_between(op_start, op_end);
-                break;
-            }
-            case 4: { // Простота
-                BigNum &target = (target_ab == 0) ? bn_a : bn_b;
-                auto t0    = Clock::now();
-                bool prime = bignum_is_prime(target);
-                auto t1    = Clock::now();
-                {
-                    std::lock_guard<std::mutex> lock(st.mtx);
-                    st.t_op     = ms_between(t0, t1);
-                    st.t_to_dec = -1.0;
-                }
-                result_is_bignum = false;
-                result_direct = prime
-                    ? "Число является простым"
-                    : "Число является составным (не простым)";
-                break;
-            }
-            case 5: { // Сравнение
-                int cmp = bignum_cmp(bn_a, bn_b);
-                auto op_end = Clock::now();
-                {
-                    std::lock_guard<std::mutex> lock(st.mtx);
-                    st.t_op     = ms_between(op_start, op_end);
-                    st.t_to_dec = -1.0;
-                }
-
-                if      (cmp < 0) result_direct = "A < B";
-                else if (cmp > 0) result_direct = "A > B";
-                else              result_direct = "A = B";
-                result_is_bignum = false;
-                break;
-            }
-        }
-    } catch (const std::exception &ex) {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        st.status_msg = std::string("Ошибка: ") + ex.what();
-        st.is_working = false;
-        return;
-    }
-
-    // Перевод результата в строку (общий путь для операций, где строка уже собрана)
-    if (result_is_bignum) {
-        auto t0 = Clock::now();
-        std::string res = bignum_to_decimal(result_bn);
-        auto t1 = Clock::now();
-
-        {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            st.result_text  = res;
-            st.t_to_dec     = ms_between(t0, t1);
-        }
-        final_result_text = res;
-    } else {
-        {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            st.result_text = result_direct;
-        }
-        final_result_text = result_direct;
-    }
-
-    save_error = write_result(final_result_text);
-
-    {
-        std::lock_guard<std::mutex> lock(st.mtx);
-        st.result_stale = false;
-        st.status_msg   = save_error.empty() ? "Готово" : save_error;
-        st.is_working   = false;
-    }
-}
-
-// -----------------------------------------------------------------------
-// Графический интерфейс
-// -----------------------------------------------------------------------
 
 static void run_ui() {
     AppState st;
@@ -471,12 +438,12 @@ static void run_ui() {
     result_opt.password  = false;
     std::string result_display_text;
     auto result_input = Input(&result_display_text, "", result_opt);
-    auto result_readonly = CatchEvent(result_input, [&](Event e) {
+    auto result_readonly = CatchEvent(result_input, [](Event e) {
         if (e.is_character() || e == Event::Backspace || e == Event::Delete || e == Event::Return)
             return true; // блокируем редактирование
         return false;
     });
-    auto result_view = Renderer(result_readonly, [&] {
+    auto result_view = Renderer(result_readonly, [&st, &result_readonly] {
         bool empty_result = false;
         {
             std::lock_guard<std::mutex> lock(st.mtx);
@@ -490,17 +457,21 @@ static void run_ui() {
     });
 
     // Отмечаем результат устаревшим при любом вводе символа
-    auto mark_stale = CatchEvent([&](Event e) {
-        if (e.is_character() || e == Event::Backspace || e == Event::Delete) {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            st.result_stale = true;
-        }
-        return false; // пропускаем событие дальше
-    });
+    auto mark_stale = [&st](std::optional<std::reference_wrapper<bool>> cache_value = std::nullopt) {
+        return CatchEvent([&st, cache_value](Event e) {
+            if (e.is_character() || e == Event::Backspace || e == Event::Delete) {
+                std::lock_guard<std::mutex> lock(st.mtx);
+                st.result_stale = true;
+                if (cache_value.has_value())
+                    cache_value->get() = false; // Помечаем кэш недействительным
+            }
+            return false; // Пропускаем другие события дальше
+        });
+    };
 
-    auto input_a_tracked   = input_a   | mark_stale;
-    auto input_b_tracked   = input_b   | mark_stale;
-    auto input_exp_tracked = input_exp | mark_stale;
+    auto input_a_tracked   = input_a   | mark_stale(st.cache_a_valid);
+    auto input_b_tracked   = input_b   | mark_stale(st.cache_b_valid);
+    auto input_exp_tracked = input_exp | mark_stale();
 
     // Выпадающий список операций
     int prev_selected_op = st.selected_op;
@@ -574,6 +545,7 @@ static void run_ui() {
                 std::lock_guard<std::mutex> lock(st.mtx);
                 st.is_working = false;
             }
+            // обновляем рендер после получения результата
             screen.PostEvent(Event::Custom);
         }).detach();
     };
@@ -589,24 +561,42 @@ static void run_ui() {
 
     // Кнопка: загрузить A из файла
     auto btn_restore_a = Button(" Загрузить A ", [&] {
+        std::string path_a;
+        {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            if (st.is_working) return;
+            path_a = st.file_a;
+        }
         try {
-            st.input_a       = wrap_number(load_from_file(st.file_a));
+            std::string loaded = wrap_number(load_from_file(path_a));
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.input_a       = loaded;
             st.cache_a_valid = false;
-            st.status_msg    = "A загружено из " + st.file_a;
+            st.status_msg    = "A загружено из " + path_a;
             st.result_stale  = true;
         } catch (const std::exception &ex) {
+            std::lock_guard<std::mutex> lock(st.mtx);
             st.status_msg = std::string("Ошибка: ") + ex.what();
         }
     }, SmallAnimatedButtonOption(Color::Green));
 
     // Кнопка: загрузить B из файла
     auto btn_restore_b = Button(" Загрузить B ", [&] {
+        std::string path_b;
+        {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            if (st.is_working) return;
+            path_b = st.file_b;
+        }
         try {
-            st.input_b       = wrap_number(load_from_file(st.file_b));
+            std::string loaded = wrap_number(load_from_file(path_b));
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.input_b       = loaded;
             st.cache_b_valid = false;
-            st.status_msg    = "B загружено из " + st.file_b;
+            st.status_msg    = "B загружено из " + path_b;
             st.result_stale  = true;
         } catch (const std::exception &ex) {
+            std::lock_guard<std::mutex> lock(st.mtx);
             st.status_msg = std::string("Ошибка: ") + ex.what();
         }
     }, SmallAnimatedButtonOption(Color::Green));
@@ -622,7 +612,8 @@ static void run_ui() {
         }
         start_spinner();
         std::thread([&st, &screen]() {
-            do_execute(st, screen);
+            do_execute(st);
+            // обновляем рендер после получения результата
             screen.PostEvent(Event::Custom);
         }).detach();
     }, SmallAnimatedButtonOption(Color::Blue));
@@ -648,7 +639,7 @@ static void run_ui() {
     // Основной рендерер
     auto renderer = Renderer(root, [&]() -> Element {
 
-        // Снимок состояния под мьютексом
+        // Снимок состояния для рендера
         std::string status_msg;
         bool        result_stale = false;
         bool        is_working   = false;
@@ -693,6 +684,7 @@ static void run_ui() {
             prev_selected_op = selected_op_local;
             std::lock_guard<std::mutex> lock(st.mtx);
             st.result_stale  = true;
+            result_stale    = true;
         }
         if (target_ab_local != prev_target_ab) {
             prev_target_ab  = target_ab_local;
@@ -764,8 +756,8 @@ static void run_ui() {
         }) | notflex;
 
         // Блок выбора операции
-        bool show_target = (st.selected_op == 3 || st.selected_op == 4);
-        bool show_exp    = (st.selected_op == 3);
+        bool show_target = (selected_op_local == 3 || selected_op_local == 4);
+        bool show_exp    = (selected_op_local == 3);
 
         Elements op_elems;
         op_elems.push_back(vbox({

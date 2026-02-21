@@ -1,56 +1,69 @@
 #include "generator.hpp"
 #include "bignum.hpp"
 
-#include <cstdio>
-#include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <stdexcept>
-#include <unistd.h>
+#include <thread>
 
 #include <gmp.h>
 
+// RAII-обёртки
+struct GmpRand {
+    gmp_randstate_t state;
+    GmpRand()  { gmp_randinit_mt(state); }
+    ~GmpRand() { gmp_randclear(state); }
+    GmpRand(const GmpRand&)            = delete;
+    GmpRand& operator=(const GmpRand&) = delete;
+};
+
+struct Mpz {
+    mpz_t val;
+    Mpz()  { mpz_init(val); }
+    ~Mpz() { mpz_clear(val); }
+    Mpz(const Mpz&)            = delete;
+    Mpz& operator=(const Mpz&) = delete;
+};
+
 void generate_and_save(const std::string &path_a, const std::string &path_b,
                        unsigned int size_bytes) {
-    gmp_randstate_t state;
-    gmp_randinit_mt(state);
+    GmpRand rng;
 
-    // Используем время + PID для разного зерна при каждом вызове
+    // Используем время + хэш thread id для разного зерна при каждом вызове
     unsigned long seed = static_cast<unsigned long>(std::time(nullptr))
-                       ^ static_cast<unsigned long>(getpid());
-    gmp_randseed_ui(state, seed);
+                       ^ static_cast<unsigned long>(
+                             std::hash<std::thread::id>{}(
+                                 std::this_thread::get_id()));
+    gmp_randseed_ui(rng.state, seed);
 
-    mpz_t n;
-    mpz_init(n);
+    Mpz n;
 
     unsigned int bits = size_bytes * 8;
     if (bits < 8) bits = 8; // минимум 1 байт
 
     auto write_number = [&](const std::string &path) {
         // Генерируем случайное число заданного размера и устанавливаем старший бит
-        mpz_urandomb(n, state, bits);
-        mpz_setbit(n, bits - 1); // гарантируем точный размер
+        mpz_urandomb(n.val, rng.state, bits);
+        mpz_setbit(n.val, bits - 1); // гарантируем точный размер
 
-        char *str = mpz_get_str(nullptr, 10, n);
+        std::unique_ptr<char, decltype(&std::free)> str{
+            mpz_get_str(nullptr, 10, n.val), std::free};
+
         std::ofstream f(path);
-        if (!f.is_open()) {
-            std::free(str);
-            mpz_clear(n);
-            gmp_randclear(state);
+        if (!f.is_open())
             throw std::runtime_error("Cannot open file for writing: " + path);
-        }
-        f << str << "\n";
-        std::free(str);
+
+        f << str.get() << "\n";
     };
 
     write_number(path_a);
 
     // Немного меняем зерно для второго числа
-    gmp_randseed_ui(state, seed ^ 0xDEADBEEFUL);
+    gmp_randseed_ui(rng.state, seed ^ 0xDEADBEEFUL);
     write_number(path_b);
-
-    mpz_clear(n);
-    gmp_randclear(state);
 }
 
 std::string load_from_file(const std::string &path) {
