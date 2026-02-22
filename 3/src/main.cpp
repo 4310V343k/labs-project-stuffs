@@ -63,6 +63,7 @@ struct AppState {
     //   3=Степень, 4=Простота, 5=Сравнение
     int  selected_op = 0;
     int  target_ab   = 0;  // 0=A, 1=B (для степени и простоты)
+    int  selected_option_component = 0; // 0=dropdown, 1=target_radio, 2=input_exp_tracked
 
     // Результат и статус
     std::string result_text  = "";
@@ -252,9 +253,9 @@ static void do_execute(AppState &st) {
             case 0: { // Сложение
                 BigNum sum  = bignum_add(bn_a, bn_b);
 
-                local_con_ra   = bignum_digit_root(bn_a);
-                local_con_rb   = bignum_digit_root(bn_b);
-                local_con_rs   = bignum_digit_root(sum);
+                local_con_ra   = bignum_digit_root_mod_9(bn_a);
+                local_con_rb   = bignum_digit_root_mod_9(bn_b);
+                local_con_rs   = bignum_digit_root_mod_9(sum);
                 local_con_ok   = (local_con_ra + local_con_rb) % 9 == local_con_rs % 9;
                 local_show_con = true;
 
@@ -419,10 +420,12 @@ static ButtonOption SmallAnimatedButtonOption(Color color) {
   return option;
 }
 
-// Создаёт все компоненты интерфейса, обработчики
+// Создаёт все компоненты интерфейса, обработчики, запускает цикл рендера
+// Компоненты - интерактивные штуки, элементы - элементы интерфейса.
+// Компоненты рендерятся в элементы в зависимости от состояния
 static void run_ui() {
     AppState st;
-    auto screen = ScreenInteractive::Fullscreen();
+    auto screen = ScreenInteractive::TerminalOutput();
 
     // Поля ввода чисел (A и B)
     auto input_a   = Input(&st.input_a, "Введите число A...");
@@ -430,6 +433,7 @@ static void run_ui() {
     // Остальные поля - однострочные
     InputOption single_line;
     single_line.multiline = false;
+    InputOption spacious_line = InputOption::Spacious();
     auto input_fa  = Input(&st.file_a, "num_a.txt", single_line);
     auto input_fb  = Input(&st.file_b, "num_b.txt", single_line);
     auto input_gb  = Input(&st.gen_bytes_str, "256", single_line);
@@ -443,21 +447,6 @@ static void run_ui() {
         return false;
     });
     std::string result_display_text;
-    InputOption result_input_opt;
-    result_input_opt.transform = [&st](InputState state) {
-        state.element |= color(Color::White) | vscroll_indicator | hscroll_indicator | frame;
-
-        bool empty_result = false;
-        {
-            std::lock_guard<std::mutex> lock(st.mtx);
-            empty_result = st.result_text.empty();
-        }
-        if (state.is_placeholder || empty_result) {
-            state.element |= color(Color::GrayDark) | dim;
-        }
-
-        return state.element;
-    };
     auto result_input = Input(&result_display_text, "") | readonly_input;
 
     // Отмечаем результат устаревшим при любом вводе символа
@@ -480,12 +469,30 @@ static void run_ui() {
     // Выпадающий список операций
     int prev_selected_op = st.selected_op;
     int prev_target_ab   = st.target_ab;
-    auto dropdown    = Dropdown(&OP_NAMES, &st.selected_op);
+
+    // Убираем неприятную рамку вокруг дропдауна
+    DropdownOption dropdown_option;
+    dropdown_option.transform = [](bool is_open, Element checkbox_element, Element radiobox_element) {
+        if (is_open) {
+            const int max_height = 12;
+            return vbox({
+                        std::move(checkbox_element),
+                        separator(),
+                        std::move(radiobox_element) | vscroll_indicator | frame |
+                            size(HEIGHT, LESS_THAN, max_height),
+                    });
+            }
+        return vbox({std::move(checkbox_element), filler()});
+    };
+    dropdown_option.radiobox.entries = &OP_NAMES;
+    dropdown_option.radiobox.selected = &st.selected_op;
+    auto dropdown    = Dropdown(dropdown_option);
 
     // Радиокнопка "Применить к"
     static const std::vector<std::string> TARGET_ENTRIES = {"Число A", "Число B"};
     auto target_radio = Radiobox(&TARGET_ENTRIES, &st.target_ab);
 
+    // Красивый спиннер во время выполнения
     auto start_spinner = [&]() {
         std::thread([&st, &screen]() {
             while (true) {
@@ -626,19 +633,18 @@ static void run_ui() {
 
     // Контейнер всех компонентов
     auto all = Container::Vertical({
-        Container::Horizontal({input_fa, input_fb, input_gb}),
+        Container::Horizontal({input_fa, input_fb}),
+        Container::Horizontal({input_gb, input_out}),
         Container::Horizontal({input_a_tracked, input_b_tracked}),
-        Container::Horizontal({btn_gen_a, btn_gen_b, btn_gen_ab,
-                               btn_restore_a, btn_restore_b}),
-        dropdown,
-        Container::Horizontal({target_radio, input_exp_tracked}),
+        Container::Horizontal({btn_gen_a, btn_restore_a, btn_gen_b, btn_restore_b, btn_gen_ab}),
+        Container::Horizontal({dropdown, target_radio, input_exp_tracked}, &st.selected_option_component),
         Container::Horizontal({btn_execute, btn_quit}),
         result_input,
     });
 
     // Основной рендерер
-    // Работает почти как реакт - все интерактивные элементы встраиваются в страницу
-    // При изменении любого элемента, который влияет на отображение (all), автоматически рендер
+    // Работает почти как реакт - все интерактивные элементы (all) встраиваются в страницу
+    // При взаимодействии с ними автоматически ререндер
     auto renderer = Renderer(all, [&]() -> Element {
 
         // Снимок состояния для текущего рендера
@@ -700,7 +706,7 @@ static void run_ui() {
         if (is_working) {
             stale_indicator = hbox({
                 text(" * Выполняется "),
-                spinner(5, static_cast<size_t>(spinner_idx))
+                spinner(15, static_cast<size_t>(spinner_idx))
             }) | color(Color::White) | bold;
         } else if (result_stale) {
             stale_indicator = text(" ! Результат устарел") | color(Color::Yellow);
@@ -715,35 +721,34 @@ static void run_ui() {
         size_t digits_b   = count_digits(input_b_val);
         size_t digits_res = count_digits(result_text);
 
-        // Блок путей к входным файлам
-        auto file_row = hbox({
-            text("Файл A: ") | color(Color::GrayLight),
-            input_fa->Render() | flex,
-            text("  Файл B: ") | color(Color::GrayLight),
-            input_fb->Render() | flex,
-        }) | border | notflex;
+        auto params_row = vbox({
+            hbox({
+                text("Файл A: ") | color(Color::GrayLight),
+                input_fa->Render() | flex,
+                text("  Файл B: ") | color(Color::GrayLight),
+                input_fb->Render() | flex,
+                }),
+            hbox({
+                text("Кол-во байт для генерации: ") | color(Color::GrayLight),
+                input_gb->Render() | size(WIDTH, EQUAL, 8) | notflex,
+                text("  Файл результата: ") | color(Color::GrayLight),
+                input_out->Render() | flex,
+                })
+            }) | border | notflex;
 
-        // Блок параметров генерации и выходного файла
-        auto params_row = hbox({
-            text("Кол-во байт для генерации: ") | color(Color::GrayLight),
-            input_gb->Render() | size(WIDTH, EQUAL, 8) | notflex,
-            text("  Файл результата: ") | color(Color::GrayLight),
-            input_out->Render() | flex,
-        }) | border | notflex;
-
-        // Блоки чисел A и B (мультистрочные, со скроллом)
+        // Блоки чисел A и B
         auto num_box = [](const std::string &label, size_t digits, Component inp) {
             return window(
                 text(" " + label + " (" + std::to_string(digits) + " цифр) "),
                 inp->Render() | vscroll_indicator | hscroll_indicator | frame |
                 size(HEIGHT, LESS_THAN, 10)
-            );
+            ) | flex;
         };
 
         auto numbers_row = hbox({
-            num_box("Число A", digits_a, input_a_tracked) | flex,
+            num_box("Число A", digits_a, input_a_tracked),
             text("  "),
-            num_box("Число B", digits_b, input_b_tracked) | flex,
+            num_box("Число B", digits_b, input_b_tracked),
         }) | flex;
 
         // Кнопки генерации и загрузки
@@ -774,13 +779,17 @@ static void run_ui() {
                 text("Применить к:") | bold,
                 target_radio->Render(),
             }));
+        } else {
+            st.selected_option_component = std::min(st.selected_option_component, 0);
         }
         op_elems.push_back(text("   "));
         if (show_exp) {
             op_elems.push_back(vbox({
                 text("Степень (1-3):") | bold,
-                input_exp_tracked->Render() | border | size(WIDTH, EQUAL, 10),
+                input_exp_tracked->Render() | size(WIDTH, EQUAL, 10),
             }));
+        } else {
+            st.selected_option_component = std::min(st.selected_option_component, 1);
         }
         Element op_controls = hbox(op_elems) | notflex;
 
@@ -796,7 +805,7 @@ static void run_ui() {
         // Результат
         auto result_box = window(
             text(" Результат (" + std::to_string(digits_res) + " цифр) "),
-            result_input->Render() | flex
+            result_input->Render() | flex | vscroll_indicator | hscroll_indicator | frame
         ) | size(HEIGHT, LESS_THAN, 14) | flex;
 
         // Блок исключения девяток (добавляется в отображение только при сложении)
@@ -859,7 +868,6 @@ static void run_ui() {
 
         Elements main_elems = {
             text(" Арифметика больших чисел") | bold | color(Color::Cyan) | border,
-            file_row,
             params_row,
             numbers_row,
             btn_row,

@@ -5,14 +5,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── GMP (only for number generation) ───────────────────────────────────────
+# -- GMP (только для генерации) ---------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GMP REQUIRED gmp)
 if(NOT GMP_FOUND)
     message(FATAL_ERROR "GMP not found. Install it with: sudo apt install libgmp-dev")
 endif()
 
-# ── FTXUI ──────────────────────────────────────────────────────────────────
+# -- FTXUI ------------------------------------------------------------------
 include(FetchContent)
 FetchContent_Declare(
     ftxui
@@ -21,7 +21,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(ftxui)
 
-# ── Executable ─────────────────────────────────────────────────────────────
 add_executable(bignums
     src/main.cpp
     src/bignum.cpp
