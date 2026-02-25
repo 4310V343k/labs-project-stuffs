@@ -406,11 +406,11 @@ BigNum bignum_isqrt(const BigNum &a) {
 
 bool bignum_is_prime(const BigNum &a) {
     if (bignum_cmp(a, one_bn()) <= 0) return false; // 0 и 1 не простые
-    if (bignum_cmp(a, BigNum{3}) <= 0) return true; // 2 и 3 простые
+    if (bignum_cmp(a, {3}) <= 0) return true; // 2 и 3 простые
     if ((a[0] & 1) == 0) return false; // чётные числа не простые
 
     BigNum limit = bignum_isqrt(a); // простых множителей выше квадратного корня быть не может
-    BigNum i = bignum_from_decimal("3");
+    BigNum i = {3};
     BigNum two = {2};
 
     // Перебор делителей от 3 до sqrt(a) с шагом 2
