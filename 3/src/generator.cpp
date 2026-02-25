@@ -1,12 +1,7 @@
 #include "generator.hpp"
 #include "bignum.hpp"
 
-#include <cstdlib>
-#include <ctime>
 #include <fstream>
-#include <functional>
-#include <memory>
-#include <stdexcept>
 #include <thread>
 
 #include <gmp.h>

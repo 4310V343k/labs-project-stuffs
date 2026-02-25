@@ -1,9 +1,8 @@
 #include "bignum.hpp"
 
-#include <algorithm>
-#include <unordered_map>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 
 /**

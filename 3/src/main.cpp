@@ -10,7 +10,6 @@
 #include <format>
 #include <fstream>
 #include <string>
-#include <vector>
 
 using namespace ftxui;
 namespace hrc = std::chrono;
