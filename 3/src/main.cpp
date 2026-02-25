@@ -531,15 +531,16 @@ static void run_ui() {
 
         std::thread([&st, &screen, gb, file_a, file_b, kind]() {
             try {
-                generate_and_save(file_a, file_b, gb);
-                std::string la = load_from_file(file_a);
-                std::string lb = load_from_file(file_b);
                 std::lock_guard<std::mutex> lock(st.mtx);
                 if (kind == GenKind::A || kind == GenKind::AB) {
+                    generate_and_save(file_a, gb);
+                    std::string la = load_from_file(file_a);
                     st.input_a       = wrap_number(la);
                     st.cache_a_valid = false;
                 }
                 if (kind == GenKind::B || kind == GenKind::AB) {
+                    generate_and_save(file_b, gb);
+                    std::string lb = load_from_file(file_b);
                     st.input_b       = wrap_number(lb);
                     st.cache_b_valid = false;
                 }

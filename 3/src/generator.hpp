@@ -1,10 +1,10 @@
 #pragma once
 #include <string>
 
-// Генерирует два случайных числа по size_bytes байт с помощью GMP
-// и записывает их десятичное представление в указанные файлы.
+// Генерирует случайное числа по size_bytes байт с помощью GMP
+// и записывает их десятичное представление в указанный файл.
 // throws std::runtime_error при ошибке ввода-вывода.
-void generate_and_save(const std::string &path_a, const std::string &path_b,
+void generate_and_save(const std::string &path,
                        unsigned int size_bytes);
 
 // Считывает число из первой строки файла.

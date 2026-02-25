@@ -23,7 +23,7 @@ struct Mpz {
     Mpz& operator=(const Mpz&) = delete;
 };
 
-void generate_and_save(const std::string &path_a, const std::string &path_b,
+void generate_and_save(const std::string &path,
                        unsigned int size_bytes) {
     GmpRand rng;
 
@@ -39,26 +39,18 @@ void generate_and_save(const std::string &path_a, const std::string &path_b,
     unsigned int bits = size_bytes * 8;
     if (bits < 8) bits = 8; // минимум 1 байт
 
-    auto write_number = [&](const std::string &path) {
-        // Генерируем случайное число заданного размера и устанавливаем старший бит
-        mpz_urandomb(n.val, rng.state, bits);
-        mpz_setbit(n.val, bits - 1); // гарантируем точный размер
+    // Генерируем случайное число заданного размера и устанавливаем старший бит
+    mpz_urandomb(n.val, rng.state, bits);
+    mpz_setbit(n.val, bits - 1); // точный размер
 
-        std::unique_ptr<char, decltype(&std::free)> str{
-            mpz_get_str(nullptr, 10, n.val), std::free};
+    std::unique_ptr<char, decltype(&std::free)> str{
+        mpz_get_str(nullptr, 10, n.val), std::free};
 
-        std::ofstream f(path);
-        if (!f.is_open())
-            throw std::runtime_error("Cannot open file for writing: " + path);
+    std::ofstream f(path);
+    if (!f.is_open())
+        throw std::runtime_error("Cannot open file for writing: " + path);
 
-        f << str.get() << "\n";
-    };
-
-    write_number(path_a);
-
-    // Немного меняем зерно для второго числа
-    gmp_randseed_ui(rng.state, seed ^ 0xDEADBEEFUL);
-    write_number(path_b);
+    f << str.get() << "\n";
 }
 
 std::string load_from_file(const std::string &path) {
