@@ -31,7 +31,7 @@ void run(ScreenInteractive &screen) {
                 error_str.clear();
             } catch (const std::exception &e) {
                 number_to.clear();
-                error_str = std::string("Ошибка: ") + e.what();
+                error_str = std::string(" Ошибка: ") + e.what();
             }
         };
     };
