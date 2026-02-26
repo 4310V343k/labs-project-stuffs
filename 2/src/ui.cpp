@@ -85,7 +85,7 @@ void run(ScreenInteractive &screen) {
             separatorEmpty(),
             quit_btn->Render() | hcenter,
             separatorEmpty(),
-        });
+        }) | border;
     });
 
     screen.Loop(renderer);
