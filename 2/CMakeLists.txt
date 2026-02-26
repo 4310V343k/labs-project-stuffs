@@ -14,9 +14,9 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ftxui)
 
 add_executable(base_converter
-    src/main.cpp
-    src/ui.cpp
-    src/converter.cpp
+    src2/main.cpp
+    src2/ui.cpp
+    # src2/converter.cpp
 )
 target_include_directories(base_converter PRIVATE src)
 target_link_libraries(base_converter
